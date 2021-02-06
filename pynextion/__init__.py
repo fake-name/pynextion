@@ -2,23 +2,35 @@
 import sys
 import traceback
 import time
-import serial
 import logging
 from .pages import Page
 from .components import Text, Number, Button, Gauge, Component
 
+
+if sys.implementation.name == "micropython":
+	import machine
+else:
+	import serial
+
+
 # pylint: disable=C0330,C0111
 
 class Nextion(object):
-	BAUD_VALUES = {
-			2400,
-			4800,
-			9600,
-			19200,
-			38400,
-			57600,
-			115200,
-		}
+	'''
+	Abstract Nextion base class.
+
+	Subclasses must provide implementations of
+
+		log
+		probe_set_baud()
+		_write_internal(bytearr)
+		_read_internal(max_read_bytes, read_timeout)
+
+	for concrete implementations
+
+	'''
+
+
 
 	ERRORS = {
 		0x00 : "Invalid instruction",
@@ -54,20 +66,14 @@ class Nextion(object):
 	BROWN  = 48192
 	YELLOW = 65504
 
+
 	def __init__(self, device_path, page_definitions=None, timeout=None):
+
+		assert hasattr(self, "log"),             "Nextion class must be subclassed with the " \
+			"subclass providing a implementation of the 'log' member!"
+
 		self.pages = []
 		self.debug = False
-
-		self.ser = serial.Serial(device_path, 9600, timeout=timeout)
-		self.ser.flushOutput()
-
-		if timeout is None:
-			self.read_timeout = 0.1
-		else:
-			self.read_timeout = timeout
-
-		self.log = logging.getLogger("Main.Nex.Protocol")
-		self.probe_set_baud()
 
 		while True:
 			try:
@@ -82,27 +88,19 @@ class Nextion(object):
 			for page_definition in page_definitions:
 				self.pages.append(Page.new_page_by_definition(self, page_definition))
 
-	def _autobaud(self):
-		for baudrate in self.BAUD_VALUES:
-			self.log.info("Autobaud: Probing with baudrate: %s", baudrate)
-			self.ser.baudrate = baudrate
-			for __ in range(2):
-				try:
-					self.ser.flush()
-					self.set_cmd_response_mode(3)
-					self.log.info("Autobaud: Connected to display with baudrate %s", baudrate)
-					return
+	########################################################
+	# Stub functions that need to be overridden
 
-				except Exception:
-					traceback.print_exc()
-					pass
+	def _write_internal(self, message):
+		raise RuntimeError("This must be overridden in a sublclass!")
 
+	def _read_internal(self, cmax, timeout):
+		raise RuntimeError("This must be overridden in a sublclass!")
 
 	def probe_set_baud(self):
-		self._autobaud()
-		self.set_baud(115200, save=True)
-		self._autobaud()
+		raise RuntimeError("This must be overridden in a sublclass!")
 
+	########################################################
 
 	def show_page_by_name(self, name):
 		result = None
@@ -129,19 +127,10 @@ class Nextion(object):
 	def set_dim(self, value, save=False):
 		self.set('dim' + 's' if save else '', value)
 
-	def set_baud(self, baud, save=False):
-
-		self.log.info("Setting display baudrate to %s", baud)
-		if baud not in self.BAUD_VALUES:
-			raise ValueError("Baud rate not supported: %s" % baud)
-
-		self.set('baud' + ('s' if save else ''), baud)
-
 	def set_page(self, value):
 		self.nx_write('page ' + str(value))
 
 	def get_page(self):
-		self.ser.flushOutput()
 		ret = self.nx_write('sendme')
 		if ret[0] == 0x66:
 			if ret[1] == 0xff:
@@ -203,7 +192,7 @@ class Nextion(object):
 ##############################
 
 	def set(self, key, value, check_return=True):
-		self.ser.flushOutput()
+
 		message = key + '=' + str(value)
 		self.nx_write(message)
 		ret = self.nx_read(check_return=True)
@@ -212,47 +201,14 @@ class Nextion(object):
 	def get_nx_error_message(err_code_char):
 		return Nextion.ERRORS[int(err_code_char)]
 
+
 	def nx_write(self, message):
 		message = message.encode("ISO-8859-1")
 		message += b"\xFF\xFF\xFF"
 
 		self.log.debug("Transmitting: %s", format(message))
-		self.ser.write(message)
+		self._write_internal(message)
 
-	def _read_internal(self, cmax, timeout):
-
-		if timeout is None:
-			timeout = self.read_timeout
-		bytes_buf = []
-
-		count = 0
-		time_now = time.time()
-		while timeout == 0 or (time.time() - time_now) < timeout:
-			read_byte = self.ser.read()
-			if read_byte is None or read_byte == b"":
-				continue
-
-
-			read_char = read_byte[0]
-
-			if read_char == 0xff and not bytes_buf:
-				continue
-
-			if read_char != 0x00:
-				self.log.debug("Rx: %02x, %s, %s", read_char, len(bytes_buf), count)
-
-				bytes_buf.append(read_char)
-				if len(bytes_buf) == cmax:
-					return bytes_buf
-				if read_char == 0xff:
-					count = count + 1
-					if count == 3:
-						if self.debug is True:
-							print("Complete. Returning")
-						return bytes_buf
-				else:
-					count = 0
-		return bytes_buf
 
 	def nx_read(self, cmax=0, timeout=None, check_return=True):
 		bytes_buf = self._read_internal(cmax, timeout)
@@ -320,6 +276,214 @@ class Nextion(object):
 			raise ValueError("Response Error with unknown code: {}".format(bytes_buf))
 
 
+class PySerialNextion(Nextion):
+
+	BAUD_VALUES = {
+			2400,
+			4800,
+			9600,
+			19200,
+			38400,
+			57600,
+			115200,
+		}
+
+	def __init__(self, device_path, timeout=None, *args, **kwargs):
+		self.log = logging.getLogger("Main.Nex.Protocol")
+
+		self.port = serial.Serial(device_path, 9600, timeout=timeout)
+		self.port.flushOutput()
+
+		if timeout is None:
+			self.read_timeout = 0.1
+		else:
+			self.read_timeout = timeout
+		self.probe_set_baud()
+
+
+		super().__init__(*args, **kwargs)
+
+	def _autobaud(self):
+		for baudrate in self.BAUD_VALUES:
+			self.log.info("Autobaud: Probing with baudrate: %s", baudrate)
+			self.port.baudrate = baudrate
+			for __ in range(2):
+				try:
+					self.port.flush()
+					self.set_cmd_response_mode(3)
+					self.log.info("Autobaud: Connected to display with baudrate %s", baudrate)
+					return
+
+				except Exception:
+					traceback.print_exc()
+
+
+	def probe_set_baud(self):
+		self._autobaud()
+		self.set_baud(115200, save=True)
+		self._autobaud()
+
+
+	def _write_internal(self, message):
+		self.port.write(message)
+		self.port.flushOutput()
+
+	def _read_internal(self, cmax, timeout):
+
+		if timeout is None:
+			timeout = self.read_timeout
+		bytes_buf = []
+
+		count = 0
+		time_now = time.time()
+		while timeout == 0 or (time.time() - time_now) < timeout:
+			read_byte = self.port.read()
+			if read_byte is None or read_byte == b"":
+				continue
+
+
+			read_char = read_byte[0]
+
+			if read_char == 0xff and not bytes_buf:
+				continue
+
+			if read_char != 0x00:
+				self.log.debug("Rx: %02x, %s, %s", read_char, len(bytes_buf), count)
+
+				bytes_buf.append(read_char)
+				if len(bytes_buf) == cmax:
+					return bytes_buf
+				if read_char == 0xff:
+					count = count + 1
+					if count == 3:
+						if self.debug is True:
+							print("Complete. Returning")
+						return bytes_buf
+				else:
+					count = 0
+		return bytes_buf
+
+	def set_baud(self, baud, save=False):
+
+		self.log.info("Setting display baudrate to %s", baud)
+		if baud not in self.BAUD_VALUES:
+			raise ValueError("Baud rate not supported: %s" % baud)
+
+		self.set('baud' + ('s' if save else ''), baud)
+
+
+class UpyNextion(Nextion):
+
+	BAUD_VALUES = {
+			2400,
+			4800,
+			9600,
+			19200,
+			38400,
+			57600,
+			115200,
+		}
+	def __init__(self, device_no, tx_pin=None, rx_pin=None, timeout=None, *args, **kwargs):
+		self.log = logging.getLogger("Main.Nex.Protocol")
+
+		self.uart = machine.UART(device_no, 9600)
+
+
+		if timeout is None:
+			self.read_timeout = 100    # in milliseconds
+		else:
+			self.read_timeout = timeout
+
+		self.init_args = {
+				"baudrate"     : 9600,
+				"bits"         : 8,
+				"parity"       : None,
+				"stop"         : 1,
+				"timeout"      : timeout,
+				"timeout_char" : timeout,
+
+		}
+
+		if tx_pin:
+			self.init_args["tx"] = tx_pin
+		if rx_pin:
+			self.init_args["rx"] = rx_pin
+
+		self.uart.init(**self.init_args)
+
+		self.probe_set_baud()
+
+
+		super().__init__(*args, **kwargs)
+
+	def _autobaud(self):
+		for baudrate in self.BAUD_VALUES:
+			self.log.info("Autobaud: Probing with baudrate: %s", baudrate)
+			self.init_args['baudrate'] = baudrate
+			self.uart.init(**self.init_args)
+			for __ in range(2):
+				try:
+					self.uart.flush()
+					self.set_cmd_response_mode(3)
+					self.log.info("Autobaud: Connected to display with baudrate %s", baudrate)
+					return
+
+				except Exception:
+					traceback.print_exc()
+
+
+	def probe_set_baud(self):
+		self._autobaud()
+		self.set_baud(115200, save=True)
+		self._autobaud()
+
+
+	def _write_internal(self, message):
+		self.uart.write(message)
+
+	def _read_internal(self, cmax, timeout):
+
+		if timeout is None:
+			timeout = self.read_timeout
+		bytes_buf = []
+
+		count = 0
+		time_now = time.time()
+		while timeout == 0 or (time.time() - time_now) < timeout:
+			read_byte = self.uart.read()
+			if read_byte is None or read_byte == b"":
+				continue
+
+
+			read_char = read_byte[0]
+
+			if read_char == 0xff and not bytes_buf:
+				continue
+
+			if read_char != 0x00:
+				self.log.debug("Rx: %02x, %s, %s", read_char, len(bytes_buf), count)
+
+				bytes_buf.append(read_char)
+				if len(bytes_buf) == cmax:
+					return bytes_buf
+				if read_char == 0xff:
+					count = count + 1
+					if count == 3:
+						if self.debug is True:
+							print("Complete. Returning")
+						return bytes_buf
+				else:
+					count = 0
+		return bytes_buf
+
+	def set_baud(self, baud, save=False):
+
+		self.log.info("Setting display baudrate to %s", baud)
+		if baud not in self.BAUD_VALUES:
+			raise ValueError("Baud rate not supported: %s" % baud)
+
+		self.set('baud' + ('s' if save else ''), baud)
+
 
 if __name__ == "__main__":
 	#ser=serial.Serial('/dev/ttyMCC',9600,timeout=0)
@@ -365,3 +529,4 @@ if __name__ == "__main__":
 
 	pageBoatSpeed.show()
 	txtBoatSpeedValue.set("Fede<3")
+
