@@ -1,16 +1,17 @@
 
 import sys
-import traceback
 import time
-import logging
 from .pages import Page
 from .components import Text, Number, Button, Gauge, Component
 
 
 if sys.implementation.name == "micropython":
 	import machine
+	traceback = None
 else:
 	import serial
+	import traceback
+	import logging
 
 
 # pylint: disable=C0330,C0111
@@ -67,7 +68,7 @@ class Nextion(object):
 	YELLOW = 65504
 
 
-	def __init__(self, device_path, page_definitions=None, timeout=None):
+	def __init__(self, page_definitions=None):
 
 		assert hasattr(self, "log"),             "Nextion class must be subclassed with the " \
 			"subclass providing a implementation of the 'log' member!"
@@ -80,7 +81,12 @@ class Nextion(object):
 				self.set_cmd_response_mode(3)
 				break
 			except Exception as err:
-				traceback.print_exc()
+				if traceback:
+					traceback.print_exc()
+				else:
+					# uPython traceback output
+					sys.print_exception(err)
+
 				self.log.info("Trying to probe device")
 				time.sleep(1)
 
@@ -206,14 +212,15 @@ class Nextion(object):
 		message = message.encode("ISO-8859-1")
 		message += b"\xFF\xFF\xFF"
 
-		self.log.debug("Transmitting: %s", format(message))
+		# self.log.debug("Transmitting: %s", message)
 		self._write_internal(message)
 
 
-	def nx_read(self, cmax=0, timeout=None, check_return=True):
-		bytes_buf = self._read_internal(cmax, timeout)
+	def nx_read(self, cmax=20, timeout=None, check_return=True):
+		# Packet end postfix is 3 bytes
+		bytes_buf = self._read_internal(cmax + 3, timeout)
 
-		self.log.debug("Read response: %s", format(bytes_buf))
+		# self.log.debug("Read response: %s", bytes_buf)
 
 		if not bytes_buf:
 			raise ValueError("No response from hardware!")
@@ -238,6 +245,7 @@ class Nextion(object):
 				Nextion.get_nx_error_message(fbyte),
 				bytes_buf
 				))
+
 		expected_postfix = [255, 255, 255]
 		if bytes_buf[-3:] != expected_postfix:
 			raise ValueError("Response missing trailing bytes: {} -> {} != {}".format(
@@ -245,6 +253,7 @@ class Nextion(object):
 
 		# Truncate the type and postfix
 		bytes_buf = bytes_buf[1:-3]
+
 
 		if fbyte == 0x01:
 			return bytes_buf
@@ -317,7 +326,6 @@ class PySerialNextion(Nextion):
 				except Exception:
 					traceback.print_exc()
 
-
 	def probe_set_baud(self):
 		self._autobaud()
 		self.set_baud(115200, save=True)
@@ -371,49 +379,88 @@ class PySerialNextion(Nextion):
 
 		self.set('baud' + ('s' if save else ''), baud)
 
+# Logging stub for micropython compabability
+class LogStub(object):
+	def __init__(self, log_path):
+		self.log_path = log_path
+
+	def debug(self, fmt_str, *args):
+		print("debug(" + self.log_path + "): " + fmt_str % args)
+	def info(self, fmt_str, *args):
+		print("info(" + self.log_path + "): " + fmt_str % args)
+	def warning(self, fmt_str, *args):
+		print("warning(" + self.log_path + "): " + fmt_str % args)
+	def error(self, fmt_str, *args):
+		print("error(" + self.log_path + "): " + fmt_str % args)
+	def critical(self, fmt_str, *args):
+		print("critical(" + self.log_path + "): " + fmt_str % args)
 
 class UpyNextion(Nextion):
 
-	BAUD_VALUES = {
-			2400,
-			4800,
-			9600,
-			19200,
-			38400,
-			57600,
+	BAUD_VALUES = [
 			115200,
-		}
+			# 2400,
+			# 4800,
+			9600,
+			# 19200,
+			# 38400,
+			# 57600,
+			115200,
+		]
 	def __init__(self, device_no, tx_pin=None, rx_pin=None, timeout=None, *args, **kwargs):
-		self.log = logging.getLogger("Main.Nex.Protocol")
 
-		self.uart = machine.UART(device_no, 9600)
+		print("Creating logger")
+		self.log = LogStub("Main.Nex.Protocol")
+
 
 
 		if timeout is None:
-			self.read_timeout = 100    # in milliseconds
+			self.read_timeout = 0.1    # in milliseconds
 		else:
 			self.read_timeout = timeout
+
+		assert self.read_timeout is not None
 
 		self.init_args = {
 				"baudrate"     : 9600,
 				"bits"         : 8,
 				"parity"       : None,
 				"stop"         : 1,
-				"timeout"      : timeout,
-				"timeout_char" : timeout,
+
+				# UART takes timeout in milliseconds
+				"timeout"      : int(self.read_timeout * 1000),
+				"timeout_char" : int(self.read_timeout * 1000),
 
 		}
 
 		if tx_pin:
 			self.init_args["tx"] = tx_pin
+		else:
+			self.init_args["tx"] = 25
+
 		if rx_pin:
 			self.init_args["rx"] = rx_pin
+		else:
+			self.init_args["rx"] = 26
+
+		print("Creating uart")
+
+		self.uart = machine.UART(
+					device_no,
+					9600,
+					tx = self.init_args["tx"],
+					rx = self.init_args["rx"],
+			)
+
+		print("Configuring")
+
+		print("uart init params:", self.init_args)
 
 		self.uart.init(**self.init_args)
 
 		self.probe_set_baud()
 
-
+		print("Super call:", args, kwargs)
 		super().__init__(*args, **kwargs)
 
 	def _autobaud(self):
@@ -423,14 +470,18 @@ class UpyNextion(Nextion):
 			self.uart.init(**self.init_args)
 			for __ in range(2):
 				try:
-					self.uart.flush()
+					# self.uart.flush()
+					# Flush hack replacement.
+					time.sleep(0.5)
 					self.set_cmd_response_mode(3)
 					self.log.info("Autobaud: Connected to display with baudrate %s", baudrate)
 					return
 
-				except Exception:
-					traceback.print_exc()
+				except Exception as err:
+					# uPython traceback output
+					sys.print_exception(err)
 
+		raise RuntimeError("Failed to establish communication with display!")
 
 	def probe_set_baud(self):
 		self._autobaud()
@@ -450,7 +501,7 @@ class UpyNextion(Nextion):
 		count = 0
 		time_now = time.time()
 		while timeout == 0 or (time.time() - time_now) < timeout:
-			read_byte = self.uart.read()
+			read_byte = self.uart.read(1)
 			if read_byte is None or read_byte == b"":
 				continue
 
@@ -461,19 +512,20 @@ class UpyNextion(Nextion):
 				continue
 
 			if read_char != 0x00:
-				self.log.debug("Rx: %02x, %s, %s", read_char, len(bytes_buf), count)
+				# self.log.debug("Rx: %02x, %s, %s", read_char, len(bytes_buf), count)
 
 				bytes_buf.append(read_char)
 				if len(bytes_buf) == cmax:
+					# self.log.debug("Reached cmax (%s) -> '%s'", cmax, bytes_buf)
 					return bytes_buf
 				if read_char == 0xff:
 					count = count + 1
 					if count == 3:
-						if self.debug is True:
-							print("Complete. Returning")
 						return bytes_buf
 				else:
 					count = 0
+
+		print("Read internal returning after reading: '%s'" % bytes_buf)
 		return bytes_buf
 
 	def set_baud(self, baud, save=False):
